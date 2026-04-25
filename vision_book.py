@@ -1,6 +1,5 @@
 import cv2
 import numpy as np
-import time
 
 CAMERA_INDEX = 0
 
@@ -8,7 +7,6 @@ MIN_AREA = 12000
 CANNY_LOW = 100
 CANNY_HIGH = 250
 
-# Medidas aproximadas del área visible de trabajo
 MESA_ANCHO_CM = 40
 MESA_ALTO_CM = 30
 
@@ -180,53 +178,8 @@ def detect_open_book(frame):
         cv2.putText(output, f"Norm: x={robot_target['x_norm']:.3f}, y={robot_target['y_norm']:.3f}", (30, 110),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
 
-        cv2.putText(output, f"Target cm: X={robot_target['x_cm']:.1f}, Y={robot_target['y_cm']:.1f}", (30, 140),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
-
-        cv2.putText(output, f"Area px: {best_metrics['area_px']:.0f} | AreaRatio: {best_metrics['area_ratio']:.3f}", (30, 170),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2)
-
-        print("Robot target:", robot_target)
-
     else:
         cv2.putText(output, "NO SE DETECTA LIBRO ABIERTO", (30, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 3)
 
     return output, edges_clean, robot_target
-
-
-def main():
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-
-    if not cap.isOpened():
-        print("No se pudo abrir la camara.")
-        return
-
-    time.sleep(1)
-
-    for _ in range(10):
-        cap.read()
-
-    while True:
-        ret, frame = cap.read()
-
-        if not ret:
-            print("No se pudo leer frame.")
-            break
-
-        result, debug_edges, robot_target = detect_open_book(frame)
-
-        cv2.imshow("Deteccion libro abierto", result)
-        cv2.imshow("Debug bordes", debug_edges)
-
-        key = cv2.waitKey(1) & 0xFF
-
-        if key == ord("q"):
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-
-
-if __name__ == "__main__":
-    main()
