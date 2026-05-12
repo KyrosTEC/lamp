@@ -1,4 +1,9 @@
 import cv2
+import threading
+import glob
+import os
+import subprocess
+import sys
 import time
 
 from vision_neon_green import detect_neon_green_paper, CAMERA_INDEX
@@ -13,17 +18,12 @@ FRAMES_TO_CONFIRM_NOT_DETECTED = 10
 
 PRINT_DETECTION_EVERY_N_FRAMES = 15
 
+LOGS_DIR = "logs"
+PLOTS_DIR = "plots"
+OPEN_PLOTS_ON_EXIT = True
+
 
 def get_tracking_zone(x, y, frame_width, frame_height):
-    """
-    Divide la imagen en 9 zonas y regresa el número de zona.
-
-    Zonas:
-        1 | 2 | 3
-        4 | 5 | 6
-        7 | 8 | 9
-    """
-
     zone_width = frame_width / 3
     zone_height = frame_height / 3
 
@@ -33,9 +33,7 @@ def get_tracking_zone(x, y, frame_width, frame_height):
     col = max(0, min(col, 2))
     row = max(0, min(row, 2))
 
-    zone = row * 3 + col + 1
-
-    return zone
+    return row * 3 + col + 1
 
 
 def get_zone_name(zone):
@@ -70,8 +68,8 @@ def draw_tracking_grid(frame, current_zone=None):
 
     for row in range(3):
         for col in range(3):
-            x = col * zone_width + 20
-            y = row * zone_height + 45
+            x_text = col * zone_width + 20
+            y_text = row * zone_height + 45
 
             if current_zone == zone_number:
                 color = (0, 0, 255)
@@ -83,7 +81,7 @@ def draw_tracking_grid(frame, current_zone=None):
             cv2.putText(
                 frame,
                 str(zone_number),
-                (x, y),
+                (x_text, y_text),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1.2,
                 color,
@@ -116,39 +114,6 @@ def draw_zone_ranges(frame):
     return frame
 
 
-def move_robot_to_zone(robot, zone):
-    if robot is None:
-        return False
-
-    if not hasattr(robot, "go_to_zone"):
-        print("ERROR: Tu SO101Controller no tiene el método go_to_zone(zone).")
-        return False
-
-    try:
-        print(f"Robot apuntando a zona {zone}: {get_zone_name(zone)}")
-        robot.go_to_zone(zone)
-        return True
-    except Exception as e:
-        print(f"ERROR al mover robot a zona {zone}: {e}")
-        return False
-
-
-def move_robot_to_safe_home(robot):
-    if robot is None:
-        return False
-
-    try:
-        if hasattr(robot, "go_safe_home"):
-            robot.go_safe_home()
-        else:
-            robot.go_home()
-
-        return True
-    except Exception as e:
-        print(f"ERROR al mover robot a SAFE HOME: {e}")
-        return False
-
-
 def reset_tracking_state():
     return {
         "current_zone": None,
@@ -159,7 +124,296 @@ def reset_tracking_state():
     }
 
 
+def create_robot_task_state():
+    return {
+        "busy": False,
+        "completed": False,
+        "success": False,
+        "error": None,
+        "label": None,
+        "target_state": None,
+        "thread": None,
+    }
+
+
+def is_robot_busy(robot_task, robot_task_lock):
+    with robot_task_lock:
+        return robot_task["busy"]
+
+
+def start_robot_task(
+    robot_task,
+    robot_task_lock,
+    label,
+    target_state,
+    task_function,
+):
+    """
+    Ejecuta una acción del robot en segundo plano.
+    Esto evita que OpenCV se congele mientras el MPC mueve el robot.
+    """
+
+    with robot_task_lock:
+        if robot_task["busy"]:
+            print(f"Robot ocupado. No se inicia nueva tarea: {label}")
+            return False
+
+        robot_task["busy"] = True
+        robot_task["completed"] = False
+        robot_task["success"] = False
+        robot_task["error"] = None
+        robot_task["label"] = label
+        robot_task["target_state"] = target_state
+
+    def worker():
+        success = False
+        error = None
+
+        try:
+            print(f"Iniciando tarea robot: {label}")
+            result = task_function()
+            success = bool(result) if result is not None else True
+            print(f"Tarea robot terminada: {label}")
+        except Exception as e:
+            error = str(e)
+            print(f"ERROR en tarea robot {label}: {e}")
+
+        with robot_task_lock:
+            robot_task["busy"] = False
+            robot_task["completed"] = True
+            robot_task["success"] = success
+            robot_task["error"] = error
+
+    thread = threading.Thread(target=worker, daemon=True)
+
+    with robot_task_lock:
+        robot_task["thread"] = thread
+
+    thread.start()
+    return True
+
+
+def consume_robot_task_result(robot_task, robot_task_lock):
+    """
+    Lee el resultado de la última tarea terminada.
+    """
+
+    with robot_task_lock:
+        if not robot_task["completed"]:
+            return None
+
+        result = {
+            "success": robot_task["success"],
+            "error": robot_task["error"],
+            "label": robot_task["label"],
+            "target_state": robot_task["target_state"],
+        }
+
+        robot_task["completed"] = False
+        return result
+
+
+def wait_for_robot_task(robot_task, robot_task_lock):
+    """
+    Espera a que termine una tarea del robot antes de desconectar.
+    """
+
+    with robot_task_lock:
+        thread = robot_task.get("thread")
+
+    if thread is not None and thread.is_alive():
+        print("Esperando a que termine la tarea actual del robot...")
+        thread.join()
+
+
+def move_robot_to_zone(robot, zone):
+    if robot is None:
+        return False
+
+    if not hasattr(robot, "go_to_zone"):
+        print("ERROR: SO101Controller no tiene el método go_to_zone(zone).")
+        return False
+
+    print(f"Robot apuntando a zona {zone}: {get_zone_name(zone)}")
+    return bool(robot.go_to_zone(zone))
+
+
+def move_robot_to_safe_home(robot):
+    if robot is None:
+        return False
+
+    if hasattr(robot, "go_safe_home"):
+        return bool(robot.go_safe_home())
+
+    return bool(robot.go_home())
+
+
+def get_session_csv_logs(session_start_time, logs_dir=LOGS_DIR):
+    """
+    Obtiene los CSV generados desde que inició esta ejecución del programa.
+    """
+
+    csv_paths = glob.glob(os.path.join(logs_dir, "*.csv"))
+    session_csvs = []
+
+    for csv_path in csv_paths:
+        try:
+            modified_time = os.path.getmtime(csv_path)
+
+            if modified_time >= session_start_time:
+                session_csvs.append(csv_path)
+
+        except OSError:
+            continue
+
+    session_csvs.sort(key=os.path.getmtime)
+
+    return session_csvs
+
+
+def generate_plots_for_session(session_start_time):
+    """
+    Genera automáticamente las gráficas para todos los CSV creados durante
+    esta ejecución del programa.
+    """
+
+    csv_logs = get_session_csv_logs(session_start_time)
+
+    if not csv_logs:
+        print("No se encontraron CSV nuevos para generar gráficas.")
+        return
+
+    if not os.path.exists("tools/plot_mpc_log.py"):
+        print("No se encontró tools/plot_mpc_log.py. No se generaron gráficas.")
+        return
+
+    print("\n==========================================")
+    print("GENERANDO GRÁFICAS MPC")
+    print("==========================================")
+
+    generated_any = False
+
+    for csv_path in csv_logs:
+        print(f"Generando gráficas para: {csv_path}")
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "tools/plot_mpc_log.py",
+                csv_path,
+                "--output-dir",
+                PLOTS_DIR,
+            ],
+            text=True,
+        )
+
+        if result.returncode != 0:
+            print(f"WARNING: No se pudieron generar gráficas para {csv_path}")
+        else:
+            generated_any = True
+
+    if generated_any:
+        print("\nGráficas generadas en:")
+        print(PLOTS_DIR)
+
+        if OPEN_PLOTS_ON_EXIT:
+            try:
+                subprocess.Popen(["xdg-open", PLOTS_DIR])
+            except Exception as e:
+                print(f"No se pudo abrir la carpeta de gráficas automáticamente: {e}")
+    else:
+        print("No se generó ninguna gráfica.")
+
+
+def draw_ui(
+    frame,
+    current_state,
+    auto_mode,
+    tracking,
+    detected_counter,
+    not_detected_counter,
+    robot_busy,
+):
+    result = draw_tracking_grid(frame, tracking["current_zone"])
+    result = draw_zone_ranges(result)
+
+    if tracking["last_robot_target"] is not None and tracking["last_seen_zone"] is not None:
+        text = (
+            f"STATE: {current_state} | AUTO: {auto_mode} | "
+            f"x={tracking['last_robot_target']['x']}, "
+            f"y={tracking['last_robot_target']['y']} | "
+            f"zone={tracking['last_seen_zone']}"
+        )
+    else:
+        text = f"STATE: {current_state} | AUTO: {auto_mode} | zone=None"
+
+    cv2.putText(
+        result,
+        text,
+        (30, 210),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 255, 255),
+        2,
+    )
+
+    if tracking["confirmed_zone"] is not None:
+        confirmed_text = (
+            f"CONFIRMED ZONE: {tracking['confirmed_zone']} - "
+            f"{get_zone_name(tracking['confirmed_zone'])}"
+        )
+    else:
+        confirmed_text = "CONFIRMED ZONE: None"
+
+    cv2.putText(
+        result,
+        confirmed_text,
+        (30, 240),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 255, 255),
+        2,
+    )
+
+    cv2.putText(
+        result,
+        f"det={detected_counter}/{FRAMES_TO_CONFIRM_DETECTED} | "
+        f"no_det={not_detected_counter}/{FRAMES_TO_CONFIRM_NOT_DETECTED}",
+        (30, 270),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 255, 255),
+        2,
+    )
+
+    cv2.putText(
+        result,
+        "r=robot | h=SAFE_HOME | g=READY | a=AUTO | q=salir",
+        (30, 300),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 255, 255),
+        2,
+    )
+
+    robot_status = "BUSY" if robot_busy else "IDLE"
+
+    cv2.putText(
+        result,
+        f"CONTROL: MPC ASYNC | ROBOT: {robot_status}",
+        (30, 330),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (0, 255, 255),
+        2,
+    )
+
+    return result
+
+
 def main():
+    session_start_time = time.time()
+
     cap = cv2.VideoCapture(CAMERA_INDEX)
 
     if not cap.isOpened():
@@ -168,6 +422,9 @@ def main():
 
     robot = None
     robot_connected = False
+
+    robot_task = create_robot_task_state()
+    robot_task_lock = threading.Lock()
 
     frame_count = 0
     detected_counter = 0
@@ -182,6 +439,8 @@ def main():
     print("Sistema iniciado.")
     print("Detectando color verde fosforescente tipo #39FF14.")
     print("Dividiendo la imagen en 9 zonas.")
+    print("Control activo: MPC articular en segundo plano.")
+    print("Al salir, se generarán automáticamente las gráficas MPC.")
     print("Teclas:")
     print("  r = conectar/calibrar robot")
     print("  h = mover a SAFE HOME manual")
@@ -194,6 +453,24 @@ def main():
             cap.read()
 
         while True:
+            task_result = consume_robot_task_result(robot_task, robot_task_lock)
+
+            if task_result is not None:
+                if task_result["success"]:
+                    current_state = task_result["target_state"]
+
+                    if current_state == "SAFE_HOME":
+                        already_safe_homed = True
+                    else:
+                        already_safe_homed = False
+
+                    print(f"Tarea completada correctamente: {task_result['label']}")
+                else:
+                    print(
+                        f"Tarea fallida: {task_result['label']} | "
+                        f"error={task_result['error']}"
+                    )
+
             ret, frame = cap.read()
 
             if not ret:
@@ -251,9 +528,12 @@ def main():
                 ):
                     tracking["confirmed_zone"] = tracking["current_zone"]
 
+                robot_busy = is_robot_busy(robot_task, robot_task_lock)
+
                 if (
                     auto_mode
                     and robot_connected
+                    and not robot_busy
                     and tracking["confirmed_zone"] is not None
                     and tracking["confirmed_zone"] != tracking["last_commanded_zone"]
                 ):
@@ -261,98 +541,59 @@ def main():
 
                     print(
                         f"Zona confirmada: {confirmed_zone} - "
-                        f"{get_zone_name(confirmed_zone)}. Apuntando robot."
+                        f"{get_zone_name(confirmed_zone)}. Apuntando robot con MPC."
                     )
 
-                    moved = move_robot_to_zone(robot, confirmed_zone)
+                    started = start_robot_task(
+                        robot_task=robot_task,
+                        robot_task_lock=robot_task_lock,
+                        label=f"go_to_zone_{confirmed_zone}",
+                        target_state=f"ZONE_{confirmed_zone}",
+                        task_function=lambda zone=confirmed_zone: move_robot_to_zone(robot, zone),
+                    )
 
-                    if moved:
-                        current_state = f"ZONE_{confirmed_zone}"
+                    if started:
                         tracking["last_commanded_zone"] = confirmed_zone
                         already_safe_homed = False
+
+                robot_busy = is_robot_busy(robot_task, robot_task_lock)
 
                 if (
                     auto_mode
                     and robot_connected
+                    and not robot_busy
                     and not_detected_counter >= FRAMES_TO_CONFIRM_NOT_DETECTED
                     and not already_safe_homed
                 ):
-                    print("Post-it no detectado. Moviendo a SAFE HOME.")
+                    print("Post-it no detectado. Moviendo a SAFE HOME con MPC.")
 
-                    moved = move_robot_to_safe_home(robot)
+                    started = start_robot_task(
+                        robot_task=robot_task,
+                        robot_task_lock=robot_task_lock,
+                        label="go_safe_home",
+                        target_state="SAFE_HOME",
+                        task_function=lambda: move_robot_to_safe_home(robot),
+                    )
 
-                    if moved:
-                        current_state = "SAFE_HOME"
-                        already_safe_homed = True
-
-                    tracking = reset_tracking_state()
+                    if started:
+                        tracking = reset_tracking_state()
 
             else:
                 tracking["current_zone"] = tracking["last_seen_zone"]
 
-            result = draw_tracking_grid(result, tracking["current_zone"])
-            result = draw_zone_ranges(result)
+            robot_busy = is_robot_busy(robot_task, robot_task_lock)
 
-            if tracking["last_robot_target"] is not None and tracking["last_seen_zone"] is not None:
-                text = (
-                    f"STATE: {current_state} | AUTO: {auto_mode} | "
-                    f"x={tracking['last_robot_target']['x']}, "
-                    f"y={tracking['last_robot_target']['y']} | "
-                    f"zone={tracking['last_seen_zone']}"
-                )
-            else:
-                text = f"STATE: {current_state} | AUTO: {auto_mode} | zone=None"
-
-            cv2.putText(
+            result = draw_ui(
                 result,
-                text,
-                (30, 210),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 255, 255),
-                2,
+                current_state=current_state,
+                auto_mode=auto_mode,
+                tracking=tracking,
+                detected_counter=detected_counter,
+                not_detected_counter=not_detected_counter,
+                robot_busy=robot_busy,
             )
 
-            if tracking["confirmed_zone"] is not None:
-                confirmed_text = (
-                    f"CONFIRMED ZONE: {tracking['confirmed_zone']} - "
-                    f"{get_zone_name(tracking['confirmed_zone'])}"
-                )
-            else:
-                confirmed_text = "CONFIRMED ZONE: None"
-
-            cv2.putText(
-                result,
-                confirmed_text,
-                (30, 240),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 255, 255),
-                2,
-            )
-
-            cv2.putText(
-                result,
-                f"det={detected_counter}/{FRAMES_TO_CONFIRM_DETECTED} | "
-                f"no_det={not_detected_counter}/{FRAMES_TO_CONFIRM_NOT_DETECTED}",
-                (30, 270),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 255, 255),
-                2,
-            )
-
-            cv2.putText(
-                result,
-                "r=robot | h=SAFE_HOME | g=READY | a=AUTO | q=salir",
-                (30, 300),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
-                (0, 255, 255),
-                2,
-            )
-
-            cv2.imshow("Deteccion post-it verde + zonas", result)
+            cv2.imshow("Deteccion post-it verde + zonas + MPC", result)
 
             if debug_mask is not None:
                 cv2.imshow("Debug mascara verde", debug_mask)
@@ -362,11 +603,13 @@ def main():
             if key == ord("q"):
                 print("Saliendo del programa...")
 
+                wait_for_robot_task(robot_task, robot_task_lock)
+
                 if robot_connected and robot is not None and not already_safe_homed:
-                    print("Regresando a SAFE HOME antes de salir...")
-                    if move_robot_to_safe_home(robot):
-                        already_safe_homed = True
-                        current_state = "SAFE_HOME"
+                    print("Regresando a SAFE HOME antes de salir con MPC...")
+                    move_robot_to_safe_home(robot)
+                    already_safe_homed = True
+                    current_state = "SAFE_HOME"
 
                 break
 
@@ -386,33 +629,43 @@ def main():
                     robot_connected = False
 
             if key == ord("h") and USE_ROBOT and robot_connected:
-                print("Moviendo manualmente a SAFE HOME...")
+                print("Moviendo manualmente a SAFE HOME con MPC...")
 
                 auto_mode = False
+                wait_for_robot_task(robot_task, robot_task_lock)
 
-                if move_robot_to_safe_home(robot):
-                    current_state = "SAFE_HOME"
-                    already_safe_homed = True
+                started = start_robot_task(
+                    robot_task=robot_task,
+                    robot_task_lock=robot_task_lock,
+                    label="manual_safe_home",
+                    target_state="SAFE_HOME",
+                    task_function=lambda: move_robot_to_safe_home(robot),
+                )
 
-                tracking = reset_tracking_state()
-                detected_counter = 0
-                not_detected_counter = 0
+                if started:
+                    tracking = reset_tracking_state()
+                    detected_counter = 0
+                    not_detected_counter = 0
 
             if key == ord("g") and USE_ROBOT and robot_connected:
-                print("Moviendo manualmente a READY...")
+                print("Moviendo manualmente a READY con MPC...")
 
                 auto_mode = False
+                wait_for_robot_task(robot_task, robot_task_lock)
 
-                try:
-                    robot.go_ready()
-                    current_state = "READY"
+                started = start_robot_task(
+                    robot_task=robot_task,
+                    robot_task_lock=robot_task_lock,
+                    label="manual_ready",
+                    target_state="READY",
+                    task_function=lambda: robot.go_ready(),
+                )
+
+                if started:
+                    tracking = reset_tracking_state()
+                    detected_counter = 0
+                    not_detected_counter = 0
                     already_safe_homed = False
-                except Exception as e:
-                    print(f"ERROR al mover a READY: {e}")
-
-                tracking = reset_tracking_state()
-                detected_counter = 0
-                not_detected_counter = 0
 
             if key == ord("a"):
                 if not robot_connected:
@@ -430,15 +683,19 @@ def main():
         cap.release()
         cv2.destroyAllWindows()
 
+        wait_for_robot_task(robot_task, robot_task_lock)
+
         if robot_connected and robot is not None:
             if not already_safe_homed:
                 try:
-                    print("Asegurando SAFE HOME antes de desconectar...")
+                    print("Asegurando SAFE HOME antes de desconectar con MPC...")
                     move_robot_to_safe_home(robot)
                 except Exception as e:
                     print(f"No se pudo mover a SAFE HOME antes de desconectar: {e}")
 
             robot.disconnect()
+
+        generate_plots_for_session(session_start_time)
 
 
 if __name__ == "__main__":
