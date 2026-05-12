@@ -1,0 +1,88 @@
+# Archivo generado automáticamente por calibrate_zone_poses.py
+
+ZONE_POSES = {
+    5: {
+        "shoulder_pan.pos": -1.89010989010989,
+        "shoulder_lift.pos": 19.64835164835165,
+        "elbow_flex.pos": -155.12087912087912,
+        "wrist_flex.pos": 91.86813186813187,
+        "wrist_roll.pos": -10.505494505494505,
+        "gripper.pos": 85.71428571428571,
+    },
+    2: {
+        "shoulder_pan.pos": 19.12087912087912,
+        "shoulder_lift.pos": 6.021978021978022,
+        "elbow_flex.pos": -135.42857142857142,
+        "wrist_flex.pos": 94.15384615384616,
+        "wrist_roll.pos": -10.593406593406593,
+        "gripper.pos": 85.71428571428571,
+    },
+    8: {
+        "shoulder_pan.pos": -27.208791208791208,
+        "shoulder_lift.pos": 6.021978021978022,
+        "elbow_flex.pos": -135.42857142857142,
+        "wrist_flex.pos": 94.41758241758242,
+        "wrist_roll.pos": -10.68131868131868,
+        "gripper.pos": 85.71428571428571,
+    },
+    4: {
+        "shoulder_pan.pos": -3.120879120879121,
+        "shoulder_lift.pos": 51.120879120879124,
+        "elbow_flex.pos": -166.54945054945054,
+        "wrist_flex.pos": 68.74725274725274,
+        "wrist_roll.pos": -10.505494505494505,
+        "gripper.pos": 85.71428571428571,
+    },
+    6: {
+        "shoulder_pan.pos": -3.120879120879121,
+        "shoulder_lift.pos": -67.2967032967033,
+        "elbow_flex.pos": -59.824175824175825,
+        "wrist_flex.pos": 97.67032967032966,
+        "wrist_roll.pos": -10.68131868131868,
+        "gripper.pos": 85.71428571428571,
+    },
+    1: {
+        "shoulder_pan.pos": 11.56043956043956,
+        "shoulder_lift.pos": 51.73626373626374,
+        "elbow_flex.pos": -162.32967032967034,
+        "wrist_flex.pos": 59.34065934065934,
+        "wrist_roll.pos": -10.505494505494505,
+        "gripper.pos": 85.71428571428571,
+    },
+    3: {
+        "shoulder_pan.pos": 35.73626373626374,
+        "shoulder_lift.pos": -44.43956043956044,
+        "elbow_flex.pos": -64.04395604395604,
+        "wrist_flex.pos": 86.41758241758242,
+        "wrist_roll.pos": -10.68131868131868,
+        "gripper.pos": 85.71428571428571,
+    },
+    7: {
+        "shoulder_pan.pos": -14.725274725274724,
+        "shoulder_lift.pos": 51.91208791208791,
+        "elbow_flex.pos": -172.35164835164835,
+        "wrist_flex.pos": 72.87912087912088,
+        "wrist_roll.pos": -10.68131868131868,
+        "gripper.pos": 85.71428571428571,
+    },
+    9: {
+        "shoulder_pan.pos": -39.34065934065934,
+        "shoulder_lift.pos": -66.5934065934066,
+        "elbow_flex.pos": -37.494505494505496,
+        "wrist_flex.pos": 70.76923076923077,
+        "wrist_roll.pos": -10.68131868131868,
+        "gripper.pos": 85.71428571428571,
+    },
+}
+
+ZONE_NAMES = {
+    1: "ARRIBA IZQUIERDA",
+    2: "ARRIBA CENTRO",
+    3: "ARRIBA DERECHA",
+    4: "CENTRO IZQUIERDA",
+    5: "CENTRO",
+    6: "CENTRO DERECHA",
+    7: "ABAJO IZQUIERDA",
+    8: "ABAJO CENTRO",
+    9: "ABAJO DERECHA",
+}
