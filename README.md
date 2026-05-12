@@ -2,11 +2,11 @@
 
 ## Overview
 
-**LAMP** is a real-time visual servoing project that integrates classical computer vision, task-space representation, Model Predictive Control (MPC), and physical robot actuation using an SO-101 robotic arm.
+**LAMP** is a real-time visual servoing project that integrates classical computer vision, task-space representation, Model Predictive Control (MPC), robot actuation, data logging, and automatic result visualization using an SO-101 robotic arm.
 
-The system uses a camera to detect a fluorescent green visual target, such as a post-it or square marker, extracts its image-space position, maps that position into a structured visual task representation, and commands the SO-101 robot arm to move toward the corresponding target region. The project is designed as an end-to-end visual servoing pipeline in which visual feedback is used to guide robot motion.
+The system uses a camera to detect a fluorescent green visual target, such as a post-it or square marker. The detected image-space position is converted into a structured 3x3 visual workspace representation. Each zone is associated with a calibrated robot pose, and the SO-101 robot moves toward the selected target configuration using an MPC-based joint-space controller.
 
-The complete pipeline is:
+The system is designed as an end-to-end visual servoing pipeline:
 
 ```txt
 Camera input
@@ -17,20 +17,22 @@ Visual feature extraction
     ↓
 Task-space representation
     ↓
-MPC control formulation
+MPC controller
     ↓
 Robot actuation
     ↓
 Visual feedback
+    ↓
+CSV logging and automatic graph generation
 ```
 
 ---
 
 ## Project Objective
 
-The objective of this project is to demonstrate a complete visual servoing system where a robot uses real-time camera feedback to regulate its motion toward a visual target.
+The objective of this project is to demonstrate a complete visual servoing system where a physical robot uses real-time camera feedback to regulate its motion toward a visual target.
 
-The robot objective is to point or move toward the detected target region using image-based information. The system converts visual measurements into control-relevant variables and uses an MPC-based control strategy to determine safe and smooth robot motion.
+The robot objective is to point or move toward the detected visual region in the workspace. The system converts camera measurements into control-relevant variables and uses an MPC-based control strategy to generate safe and smooth robot motion.
 
 ---
 
@@ -53,11 +55,11 @@ The image is divided into a 3x3 grid:
 +----------------+----------------+----------------+
 ```
 
-Each visual zone is associated with a calibrated SO-101 pose. The robot uses the visual feedback to move toward the target zone while maintaining a safe home behavior when the target is no longer detected.
+Each visual zone is associated with a calibrated SO-101 pose. The robot uses visual feedback to move toward the corresponding target zone while maintaining safe behavior when the target disappears or when the program exits.
 
 ---
 
-## Current Features
+## Main Features
 
 - Real-time camera capture using OpenCV.
 - Classical computer vision target detection.
@@ -66,11 +68,14 @@ Each visual zone is associated with a calibrated SO-101 pose. The robot uses the
 - Contour detection and target center extraction.
 - 3x3 visual workspace grid.
 - Zone-based task-space representation.
-- Calibrated SO-101 robot poses for each visual zone.
-- Smooth joint-space interpolation.
-- MPC-based control structure for visual servoing.
-- Safe home pose behavior.
+- Calibrated SO-101 poses for each visual zone.
+- MPC-based joint-space control.
+- Command-state MPC strategy for smoother and more reliable servo movement.
+- Asynchronous robot motion using background threads.
+- Safe home behavior when the target is lost or the program exits.
 - Manual and automatic operation modes.
+- CSV logging of MPC motion data.
+- Automatic graph generation at program exit.
 - Real robot actuation using LeRobot and the SO-101 follower configuration.
 
 ---
@@ -83,7 +88,7 @@ The physical setup includes:
 - USB camera or webcam.
 - Computer running Python.
 - USB serial connection to the SO-101 robot.
-- Fluorescent green target marker.
+- Fluorescent green visual marker.
 - Table workspace for visual tracking.
 
 ---
@@ -95,6 +100,8 @@ The project uses:
 - Python
 - OpenCV
 - NumPy
+- Pandas
+- Matplotlib
 - LeRobot
 - SO-101 follower robot configuration
 
@@ -107,15 +114,27 @@ Recommended project organization:
 ```txt
 lamp/
 ├── main.py
+├── mpc_controller.py
+├── mpc_logger.py
 ├── so101_controller.py
 ├── vision_neon_green.py
 ├── zone_poses.py
 ├── README.md
 ├── LICENSE
 │
+├── logs/
+│   └── *.csv
+│
+├── plots/
+│   └── <csv_name>/
+│       ├── mpc_max_error.png
+│       ├── mpc_real_vs_commanded_positions.png
+│       └── mpc_control_effort.png
+│
 ├── tools/
 │   ├── calibrate_zone_poses.py
 │   ├── inspect_so101.py
+│   ├── plot_mpc_log.py
 │   ├── print_calibration_path.py
 │   └── recalibrate_so101.py
 │
@@ -152,7 +171,9 @@ Responsibilities:
 - Maps the target to a visual zone.
 - Confirms detections across multiple frames.
 - Sends zone commands to the SO-101 controller.
+- Runs robot movement asynchronously so the camera does not freeze.
 - Returns the robot to safe home when the target is lost.
+- Generates MPC plots automatically when the program exits.
 - Handles manual keyboard controls.
 
 Keyboard controls:
@@ -194,11 +215,12 @@ Responsibilities:
 
 - Connect and disconnect the SO-101 robot.
 - Read current robot joint observations.
-- Move smoothly between poses.
-- Execute calibrated zone poses.
+- Validate target poses.
+- Execute MPC-based movement toward target poses.
 - Execute ready pose.
 - Execute safe home pose.
-- Provide a safe motion interface for the main visual servoing loop.
+- Execute calibrated zone poses.
+- Log MPC data during each motion.
 
 Important methods:
 
@@ -207,11 +229,104 @@ connect()
 disconnect()
 get_pose()
 smooth_move_to_pose()
+mpc_move_to_pose()
 go_home()
 go_ready()
 go_safe_home()
 go_to_zone(zone)
 ```
+
+---
+
+### `mpc_controller.py`
+
+MPC controller module.
+
+Responsibilities:
+
+- Compute joint-space control errors.
+- Calculate incremental joint commands.
+- Apply per-joint control weights.
+- Apply per-joint effort penalties.
+- Apply maximum step constraints.
+- Return the next command action for the robot.
+
+The implemented model is:
+
+```txt
+q(k+1) = q(k) + u(k)
+```
+
+Where:
+
+- `q(k)` is the current or commanded joint state.
+- `u(k)` is the incremental joint command.
+- `q(k+1)` is the next commanded joint state.
+
+---
+
+### `mpc_logger.py`
+
+MPC logging module.
+
+Responsibilities:
+
+- Create one CSV file per MPC motion.
+- Store real joint positions.
+- Store commanded joint positions.
+- Store joint errors.
+- Store maximum error per iteration.
+- Store iteration index and motion label.
+
+The CSV columns are:
+
+```txt
+timestamp
+iteration
+zone
+shoulder_pan_real
+shoulder_lift_real
+elbow_flex_real
+wrist_flex_real
+wrist_roll_real
+gripper_real
+shoulder_pan_cmd
+shoulder_lift_cmd
+elbow_flex_cmd
+wrist_flex_cmd
+wrist_roll_cmd
+gripper_cmd
+shoulder_pan_error
+shoulder_lift_error
+elbow_flex_error
+wrist_flex_error
+wrist_roll_error
+gripper_error
+max_error
+```
+
+---
+
+### `tools/plot_mpc_log.py`
+
+Plot generation script.
+
+Responsibilities:
+
+- Read MPC CSV logs.
+- Generate error convergence plots.
+- Generate real vs commanded joint position plots.
+- Generate control effort plots.
+
+Generated plots:
+
+```txt
+mpc_max_error.png
+mpc_real_vs_commanded_positions.png
+mpc_control_effort.png
+```
+
+When `main.py` exits, it automatically runs this script for all CSV logs generated during the current session.
 
 ---
 
@@ -235,7 +350,7 @@ ZONE_POSES = {
 }
 ```
 
-The robot uses these calibrated poses to point toward the detected zone.
+The robot uses these calibrated poses as MPC target configurations.
 
 ---
 
@@ -273,15 +388,6 @@ Where:
 
 - `x` is the horizontal coordinate of the target center.
 - `y` is the vertical coordinate of the target center.
-
-The system also computes normalized visual coordinates:
-
-```txt
-x_norm = x / frame_width
-y_norm = y / frame_height
-```
-
-These variables are used as task-space information for the visual servoing process.
 
 ---
 
@@ -324,16 +430,12 @@ This representation connects the visual feature extracted from the camera to the
 
 The project uses Model Predictive Control as the optimal control strategy for the visual servoing task.
 
-The controller is formulated around the idea of reducing visual error while producing smooth and safe robot motions.
-
 ### State Representation
 
-A representative state vector is:
+The controller uses the SO-101 joint configuration as the control state:
 
 ```txt
 x_k = [
-    e_u,
-    e_v,
     q_1,
     q_2,
     q_3,
@@ -345,26 +447,34 @@ x_k = [
 
 Where:
 
-- `e_u` is the horizontal image-space error.
-- `e_v` is the vertical image-space error.
-- `q_i` are the SO-101 joint positions.
-
-### Visual Error
-
-The desired point can be defined as the center of the image or as the center of the selected visual zone.
-
 ```txt
-p_desired = [u_d, v_d]
-p_detected = [u, v]
+q_1 = shoulder_pan.pos
+q_2 = shoulder_lift.pos
+q_3 = elbow_flex.pos
+q_4 = wrist_flex.pos
+q_5 = wrist_roll.pos
+q_6 = gripper.pos
 ```
 
-The visual error is:
+The vision system provides the visual target state:
 
 ```txt
-e = p_detected - p_desired
+p = [x, y]
 ```
 
-This error describes how far the detected target is from the desired visual configuration.
+and the task-space zone:
+
+```txt
+s ∈ {1, ..., 9}
+```
+
+The zone determines the target robot pose:
+
+```txt
+q_target = ZONE_POSES[s]
+```
+
+---
 
 ### Control Input
 
@@ -381,53 +491,79 @@ u_k = [
 ]
 ```
 
-Where each `Δq_i` is a change in a robot joint command.
+The commanded state evolves as:
+
+```txt
+q_cmd(k+1) = q_cmd(k) + u_k
+```
+
+The robot receives `q_cmd(k+1)` as the next joint-space command.
+
+---
+
+### System Model
+
+The controller uses a discrete-time joint-space model:
+
+```txt
+q(k+1) = q(k) + u(k)
+```
+
+This model is appropriate for the current implementation because the SO-101 is commanded through joint-position targets.
+
+---
 
 ### Cost Function
 
-The MPC objective minimizes visual error and control effort:
+The MPC objective minimizes joint error and control effort:
 
 ```txt
-J = Σ (e_kᵀ Q e_k + u_kᵀ R u_k)
+J = Σ ( ||q_k - q_target||²_Q + ||u_k||²_R )
 ```
 
 Where:
 
-- `Q` penalizes image-space tracking error.
-- `R` penalizes excessive joint movement.
-- `e_k` is the visual error at time step `k`.
-- `u_k` is the control input at time step `k`.
+- `q_k` is the current or commanded joint configuration.
+- `q_target` is the calibrated target pose associated with the visual zone.
+- `u_k` is the incremental joint command.
+- `Q` penalizes position error.
+- `R` penalizes excessive movement.
+
+---
 
 ### Constraints
 
-The controller considers constraints such as:
+The controller considers:
 
-- Joint limits.
-- Maximum relative joint movement.
-- Maximum joint velocity.
-- Workspace safety limits.
+- Maximum step per joint.
+- Maximum relative movement target.
+- Joint-space safety limits.
+- Error tolerance before considering the target reached.
 - Safe home behavior.
+- Valid joint names and pose validation.
 - Smooth trajectory requirements.
 
-### Control Behavior
+---
 
-The controller receives the visual target state, evaluates the motion objective, and generates safe joint-space actions for the SO-101 arm.
+### Command-State MPC Strategy
 
-The visual feedback loop is:
+The controller uses a command-state MPC strategy. Instead of always calculating the next command directly from the measured joint position, it maintains an internal commanded pose:
 
 ```txt
-Detect target
-    ↓
-Compute visual error
-    ↓
-Solve MPC objective
-    ↓
-Generate robot command
-    ↓
-Move SO-101
-    ↓
-Capture next frame
+q_cmd
 ```
+
+At every MPC iteration:
+
+```txt
+1. Read real robot pose q_real.
+2. Compute real error q_target - q_real.
+3. Update internal command state q_cmd.
+4. Send q_cmd to the robot.
+5. Log q_real, q_cmd, error, and max error.
+```
+
+This approach improves reliability for joints that move slowly under load, such as shoulder and elbow joints, because the commanded target continues progressing even if the physical joint lags behind.
 
 ---
 
@@ -438,13 +574,62 @@ The system operates in closed loop using camera feedback.
 The closed-loop behavior is:
 
 1. The camera captures the current frame.
-2. The vision module detects the target.
+2. The vision module detects the fluorescent green target.
 3. The system extracts the target center.
-4. The target is mapped to the task-space representation.
-5. The MPC control logic determines the motion objective.
-6. The robot moves toward the corresponding target configuration.
-7. The next camera frame updates the visual feedback.
-8. If the target disappears, the robot returns to safe home.
+4. The target center is mapped into a 3x3 task-space zone.
+5. The zone selects a target robot pose.
+6. The MPC controller generates incremental joint commands.
+7. The SO-101 moves toward the target configuration.
+8. The camera continues updating the visual state.
+9. If the target disappears, the robot returns to safe home.
+
+---
+
+## Data Logging and Automatic Graph Generation
+
+Every MPC movement creates a CSV file in:
+
+```txt
+logs/
+```
+
+Example:
+
+```txt
+logs/20260512_000601_zone_2_ARRIBA_CENTRO.csv
+```
+
+When the program exits, `main.py` automatically generates plots for all logs created during the current execution.
+
+Generated plots are stored in:
+
+```txt
+plots/
+```
+
+Each CSV receives its own plot folder:
+
+```txt
+plots/
+└── 20260512_000601_zone_2_ARRIBA_CENTRO/
+    ├── mpc_max_error.png
+    ├── mpc_real_vs_commanded_positions.png
+    └── mpc_control_effort.png
+```
+
+The generated graphs are:
+
+1. **Maximum error vs iteration**
+
+   Shows MPC convergence behavior.
+
+2. **Real vs commanded joint positions**
+
+   Shows how the robot joints follow the commanded trajectory.
+
+3. **Control effort per joint**
+
+   Shows the incremental control action `Δq`.
 
 ---
 
@@ -490,13 +675,11 @@ The default port is:
 /dev/ttyACM0
 ```
 
-If your robot uses a different port, update:
+If your robot uses a different port, update this value in `so101_controller.py`:
 
 ```python
 PORT = "/dev/ttyACM0"
 ```
-
-inside `so101_controller.py`.
 
 ### 3. Run the project
 
@@ -516,11 +699,35 @@ g = move to ready
 q = quit
 ```
 
+When exiting with `q`, the system automatically generates MPC graphs from the CSV logs of that session.
+
+---
+
+## Generate Graphs Manually
+
+If needed, graphs can also be generated manually:
+
+```bash
+PYTHONPATH=. python tools/plot_mpc_log.py logs/<csv_file>.csv
+```
+
+Example:
+
+```bash
+PYTHONPATH=. python tools/plot_mpc_log.py logs/20260512_000601_zone_2_ARRIBA_CENTRO.csv
+```
+
+Generated plots are stored in:
+
+```txt
+plots/
+```
+
 ---
 
 ## Calibration
 
-The robot and the visual zones must be calibrated before running a reliable demo.
+The robot and visual zones must be calibrated before running a reliable demo.
 
 ### Calibrate zone poses
 
@@ -528,7 +735,7 @@ The robot and the visual zones must be calibrated before running a reliable demo
 PYTHONPATH=. python tools/calibrate_zone_poses.py
 ```
 
-This script is used to record the SO-101 pose associated with each of the 9 visual zones.
+This script records the SO-101 pose associated with each of the 9 visual zones.
 
 ### Inspect SO-101 calibration
 
@@ -576,6 +783,7 @@ These scripts validate:
 - Shoulder pan movement.
 - Safe home behavior.
 - Zone pose behavior.
+- MPC movement toward calibrated zones.
 
 ---
 
@@ -590,15 +798,16 @@ Recommended live demo flow:
 5. Press `a` to activate automatic mode.
 6. Move the target between different visual zones.
 7. Observe the detected zone on screen.
-8. Observe the SO-101 robot moving toward the corresponding zone.
+8. Observe the SO-101 moving toward the corresponding zone using MPC.
 9. Remove the target and verify that the robot returns to safe home.
 10. Press `q` to exit safely.
+11. Open the generated plots in `plots/`.
 
 ---
 
 ## Results to Document
 
-For the final report or presentation, the following results can be documented:
+For the final report or presentation, document:
 
 - Target detection success under different lighting conditions.
 - Detected center coordinates.
@@ -606,8 +815,9 @@ For the final report or presentation, the following results can be documented:
 - Robot response to different zones.
 - Time required to move between zones.
 - Safe home return behavior.
-- Visual error reduction over time.
-- Control effort during motion.
+- Maximum error convergence.
+- Real vs commanded joint positions.
+- Control effort per joint.
 - Closed-loop response consistency.
 
 ---
@@ -635,6 +845,7 @@ Before running automatic mode:
 - Zone calibration depends on the physical placement of the robot and camera.
 - Robot accuracy depends on correct SO-101 motor calibration.
 - The current visual target is color-based; other target types require adjusting the vision pipeline.
+- The current MPC formulation uses calibrated zone poses as target configurations.
 
 ---
 
@@ -643,15 +854,13 @@ Before running automatic mode:
 Possible improvements include:
 
 - Add continuous image-based visual servoing using normalized image error.
-- Log visual error, joint positions, and control commands.
-- Plot convergence behavior.
-- Add real-time control effort visualization.
-- Improve robustness to illumination changes.
 - Add automatic HSV calibration.
 - Add more advanced geometric target detection.
 - Add trajectory smoothing between zone transitions.
-- Add quantitative evaluation scripts.
-- Compare zone-based visual servoing and continuous MPC visual servoing.
+- Add quantitative comparison between different MPC gains.
+- Add real-time plot preview inside the interface.
+- Add support for multiple target colors or markers.
+- Compare zone-based visual servoing and continuous image-based MPC.
 
 ---
 
