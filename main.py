@@ -12,6 +12,7 @@ except ImportError:
     serial = None
 
 from vision_neon_green import detect_neon_green_paper, CAMERA_INDEX
+from vision_thread import VisionThread
 from so101_controller import SO101Controller
 
 
@@ -21,10 +22,14 @@ USE_LEDS = True
 ESP32_LED_PORT = "/dev/ttyUSB0"
 ESP32_LED_BAUDRATE = 115200
 
-DETECT_EVERY_N_FRAMES = 2
+# Modo de tracking: True = seguimiento continuo con interpolación IDW + EMA.
+# False = comportamiento original por zonas (discreto).
+TRACKING_MODE = True
 
-FRAMES_TO_CONFIRM_DETECTED = 8
-FRAMES_TO_CONFIRM_NOT_DETECTED = 10
+# Frames consecutivos para confirmar detección/pérdida del objeto.
+# Reducidos vs valores originales para menor latencia.
+FRAMES_TO_CONFIRM_DETECTED = 3      # era 8
+FRAMES_TO_CONFIRM_NOT_DETECTED = 5  # era 10
 
 PRINT_DETECTION_EVERY_N_FRAMES = 15
 
@@ -540,11 +545,24 @@ def update_leds_for_state(
 def main():
     session_start_time = time.time()
 
-    cap = cv2.VideoCapture(CAMERA_INDEX)
+    # --- Hilo de visión dedicado -------------------------------------------
+    vision_thread = VisionThread(camera_index=CAMERA_INDEX, target_fps=60.0)
+    vision_thread.start()
 
-    if not cap.isOpened():
-        print("No se pudo abrir la camara.")
+    # Esperar a que el VisionThread publique al menos un frame
+    print("Esperando primer frame del VisionThread...")
+    for _ in range(100):
+        if vision_thread.get_latest() is not None:
+            break
+        time.sleep(0.05)
+    else:
+        print("ERROR: VisionThread no pudo obtener frames de la cámara.")
+        vision_thread.stop()
         return
+
+    # El cap ahora es solo para mantener compatibilidad con el código de UI.
+    # El VisionThread ya tiene su propio cap interno.
+    cap = None
 
     leds = LEDController(
         port=ESP32_LED_PORT,
@@ -573,6 +591,7 @@ def main():
     print("Sistema iniciado.")
     print("Detectando color verde fosforescente tipo #39FF14.")
     print("Dividiendo la imagen en 9 zonas.")
+    print(f"Modo tracking: {'CONTINUO (IDW+EMA)' if TRACKING_MODE else 'ZONAS DISCRETAS'}.")
     print("Control activo: MPC articular en segundo plano.")
     print("Control LEDs: automatico por ESP32.")
     print("Al salir, se generarán automáticamente las gráficas MPC.")
@@ -585,7 +604,7 @@ def main():
 
     try:
         for _ in range(10):
-            cap.read()
+            pass  # VisionThread ya hace el calentamiento
 
         while True:
             task_result = consume_robot_task_result(robot_task, robot_task_lock)
@@ -598,6 +617,9 @@ def main():
                         already_safe_homed = True
                         leds.off()
                         led_state = "OFF"
+                        # Resetear filtros EMA al llegar a home
+                        if robot is not None:
+                            robot.reset_tracking_filters()
                     else:
                         already_safe_homed = False
 
@@ -608,28 +630,23 @@ def main():
                         f"error={task_result['error']}"
                     )
 
-            ret, frame = cap.read()
+            # --- Leer el snapshot más reciente del VisionThread (sin bloquear) ---
+            snapshot = vision_thread.get_latest()
 
-            if not ret:
-                print("No se pudo leer frame.")
-                leds.off()
-                break
+            if snapshot is None:
+                # Aun no hay frame disponible (raro después del calentamiento)
+                cv2.waitKey(1)
+                continue
 
+            result, debug_mask, robot_target = snapshot
             frame_count += 1
+            color_detected = robot_target is not None
 
-            result = frame.copy()
-            debug_mask = None
-            robot_target = None
-
-            if frame_count % DETECT_EVERY_N_FRAMES == 0:
-                result, debug_mask, robot_target = detect_neon_green_paper(frame)
-                color_detected = robot_target is not None
-
-                if color_detected:
+            if color_detected:
                     detected_counter += 1
                     not_detected_counter = 0
 
-                    frame_h, frame_w = frame.shape[:2]
+                    frame_h, frame_w = result.shape[:2]
 
                     current_zone = get_tracking_zone(
                         robot_target["x"],
@@ -645,21 +662,24 @@ def main():
                     if frame_count % PRINT_DETECTION_EVERY_N_FRAMES == 0:
                         print(
                             f"Objeto detectado | "
-                            f"x={robot_target['x']} | "
-                            f"y={robot_target['y']} | "
+                            f"x_norm={robot_target['x_norm']:.3f} | "
+                            f"y_norm={robot_target['y_norm']:.3f} | "
                             f"zona={current_zone} | "
-                            f"{get_zone_name(current_zone)}"
+                            f"VisionFPS={vision_thread.fps:.1f}"
                         )
 
-                else:
+            else:
                     not_detected_counter += 1
                     detected_counter = 0
                     tracking["current_zone"] = None
                     tracking["confirmed_zone"] = None
                     tracking["last_robot_target"] = None
                     tracking["last_seen_zone"] = None
+                    # Resetear filtros EMA al perder el objeto
+                    if robot is not None:
+                        robot.reset_tracking_filters()
 
-                led_state = update_leds_for_state(
+            led_state = update_leds_for_state(
                     leds=leds,
                     auto_mode=auto_mode,
                     robot_connected=robot_connected,
@@ -668,15 +688,44 @@ def main():
                     tracking=tracking,
                 )
 
-                if (
+            if (
                     color_detected
                     and detected_counter >= FRAMES_TO_CONFIRM_DETECTED
                     and tracking["current_zone"] is not None
                 ):
                     tracking["confirmed_zone"] = tracking["current_zone"]
 
-                robot_busy = is_robot_busy(robot_task, robot_task_lock)
+            robot_busy = is_robot_busy(robot_task, robot_task_lock)
 
+            # --- Lógica de control del robot ---
+            if TRACKING_MODE:
+                # MODO CONTINUO: una iteración MPC por cada frame detectado
+                if (
+                    auto_mode
+                    and robot_connected
+                    and not robot_busy
+                    and color_detected
+                    and detected_counter >= FRAMES_TO_CONFIRM_DETECTED
+                    and robot_target is not None
+                ):
+                    x_norm = robot_target["x_norm"]
+                    y_norm = robot_target["y_norm"]
+                    confirmed_zone = tracking["confirmed_zone"]
+
+                    started = start_robot_task(
+                        robot_task=robot_task,
+                        robot_task_lock=robot_task_lock,
+                        label=f"track_continuous_z{confirmed_zone}",
+                        target_state=f"TRACKING",
+                        task_function=lambda xn=x_norm, yn=y_norm: robot.mpc_track_continuous(xn, yn),
+                    )
+
+                    if started:
+                        tracking["last_commanded_zone"] = confirmed_zone
+                        already_safe_homed = False
+
+            else:
+                # MODO DISCRETO (comportamiento original)
                 if (
                     auto_mode
                     and robot_connected
@@ -703,9 +752,9 @@ def main():
                         tracking["last_commanded_zone"] = confirmed_zone
                         already_safe_homed = False
 
-                robot_busy = is_robot_busy(robot_task, robot_task_lock)
+            robot_busy = is_robot_busy(robot_task, robot_task_lock)
 
-                if (
+            if (
                     auto_mode
                     and robot_connected
                     and not robot_busy
@@ -727,9 +776,8 @@ def main():
 
                     if started:
                         tracking = reset_tracking_state()
-
-            else:
-                tracking["current_zone"] = tracking["last_seen_zone"]
+                        if robot is not None:
+                            robot.reset_tracking_filters()
 
             robot_busy = is_robot_busy(robot_task, robot_task_lock)
 
@@ -742,6 +790,17 @@ def main():
                 not_detected_counter=not_detected_counter,
                 robot_busy=robot_busy,
                 led_state=led_state,
+            )
+
+            # Mostrar FPS del hilo de visión en el frame
+            cv2.putText(
+                result,
+                f"VisionThread FPS: {vision_thread.fps:.1f} | MODE: {'CONTINUO' if TRACKING_MODE else 'ZONAS'}",
+                (30, 360),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                (0, 200, 255),
+                2,
             )
 
             cv2.imshow("Deteccion post-it verde + zonas + MPC", result)
@@ -852,8 +911,8 @@ def main():
     finally:
         leds.off()
 
-        cap.release()
         cv2.destroyAllWindows()
+        vision_thread.stop()
 
         wait_for_robot_task(robot_task, robot_task_lock)
 

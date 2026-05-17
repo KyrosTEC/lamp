@@ -5,6 +5,53 @@ import numpy as np
 CAMERA_INDEX = 0
 
 
+def detect_position_only(frame):
+    """
+    Versión ligera del detector: solo retorna datos de posición, sin dibujar.
+
+    Más eficiente cuando el resultado se usa solo para control (no display).
+
+    Returns:
+        robot_target: dict con posición o None.
+    """
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    lower_green = np.array([35, 80, 80])
+    upper_green = np.array([90, 255, 255])
+
+    mask = cv2.inRange(hsv, lower_green, upper_green)
+
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        return None
+
+    largest_contour = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(largest_contour)
+
+    if area <= 800:
+        return None
+
+    x, y, w, h = cv2.boundingRect(largest_contour)
+    center_x = x + w // 2
+    center_y = y + h // 2
+
+    frame_h, frame_w = frame.shape[:2]
+
+    return {
+        "x": center_x,
+        "y": center_y,
+        "x_norm": center_x / frame_w,
+        "y_norm": center_y / frame_h,
+        "area": area,
+        "bbox": (x, y, w, h),
+    }
+
+
 def detect_neon_green_paper(frame):
     """
     Detecta un objeto color verde fosforescente tipo #39FF14.

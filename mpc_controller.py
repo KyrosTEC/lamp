@@ -74,6 +74,27 @@ class MPCJointController:
             "gripper.pos": 3.0,
         }
 
+        # Gains más agresivos para modo tracking continuo.
+        # Mayor control_gain + mayor max_step para joints críticos.
+        self.tracking_control_gain = 0.80
+        self.tracking_max_step_by_joint = {
+            "shoulder_pan.pos": 4.0,
+            "shoulder_lift.pos": 5.5,
+            "elbow_flex.pos": 5.0,
+            "wrist_flex.pos": 4.0,
+            "wrist_roll.pos": 3.0,
+            "gripper.pos": 3.0,
+        }
+        # R weights reducidos para modo tracking (más reactivo)
+        self.tracking_r_weights = {
+            "shoulder_pan.pos": 0.4,
+            "shoulder_lift.pos": 0.35,
+            "elbow_flex.pos": 0.4,
+            "wrist_flex.pos": 0.5,
+            "wrist_roll.pos": 0.5,
+            "gripper.pos": 0.5,
+        }
+
     def compute_joint_error(self, current_pose, target_pose):
         errors = {}
 
@@ -133,6 +154,44 @@ class MPCJointController:
             desired_step = effective_gain * error
 
             max_step = self.max_step_by_joint.get(joint, self.max_step_deg)
+            step = float(np.clip(desired_step, -max_step, max_step))
+
+            action[joint] = current_value + step
+            steps[joint] = step
+
+        max_error = max(abs(error) for error in errors.values()) if errors else 0.0
+
+        return action, max_error, errors, steps
+
+    def compute_next_action_tracking(self, current_pose, target_pose):
+        """
+        Variante de compute_next_action con gains más agresivos para
+        tracking continuo. Usa tracking_control_gain y tracking_max_step_by_joint.
+
+        Diseñado para llamarse desde un bucle externo que actualiza el target
+        en cada iteración (no espera convergencia completa).
+
+        Returns:
+            action, max_error, errors, steps  (mismo formato que compute_next_action)
+        """
+        action = current_pose.copy()
+        errors = self.compute_joint_error(current_pose, target_pose)
+        steps = {}
+
+        for joint in JOINT_KEYS:
+            if joint not in errors:
+                continue
+
+            current_value = float(current_pose[joint])
+            error = errors[joint]
+
+            q_weight = self.q_weights.get(joint, 1.0)
+            r_weight = self.tracking_r_weights.get(joint, 0.5)
+
+            effective_gain = self.tracking_control_gain * (q_weight / (q_weight + r_weight))
+            desired_step = effective_gain * error
+
+            max_step = self.tracking_max_step_by_joint.get(joint, self.max_step_deg)
             step = float(np.clip(desired_step, -max_step, max_step))
 
             action[joint] = current_value + step

@@ -1,7 +1,10 @@
 import time
+import math
 from typing import Dict, Optional
 
+# pyrefly: ignore [missing-import]
 from lerobot.robots.utils import make_robot_from_config
+# pyrefly: ignore [missing-import]
 from lerobot.robots.so_follower import SO101FollowerConfig
 
 from zone_poses import ZONE_POSES, ZONE_NAMES
@@ -50,6 +53,55 @@ JOINT_KEYS = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Mapa de coordenadas normalizadas (x_norm, y_norm) para cada zona.
+# Corresponde a la grilla 3x3: zona 1=arriba-izq ... zona 9=abajo-der.
+# Se usa como centro de referencia para la interpolación IDW.
+# ---------------------------------------------------------------------------
+ZONE_GRID_COORDS = {
+    1: (1/6, 1/6),   # arriba izquierda
+    2: (3/6, 1/6),   # arriba centro
+    3: (5/6, 1/6),   # arriba derecha
+    4: (1/6, 3/6),   # centro izquierda
+    5: (3/6, 3/6),   # centro
+    6: (5/6, 3/6),   # centro derecha
+    7: (1/6, 5/6),   # abajo izquierda
+    8: (3/6, 5/6),   # abajo centro
+    9: (5/6, 5/6),   # abajo derecha
+}
+
+
+class EMAFilter:
+    """
+    Filtro Exponential Moving Average para suavizar coordenadas ruidosas.
+
+    y[n] = alpha * x[n] + (1 - alpha) * y[n-1]
+
+    Alpha bajo (e.g. 0.2) = muy suave, más lag.
+    Alpha alto (e.g. 0.5) = más reactivo, menos suave.
+    """
+
+    def __init__(self, alpha: float = 0.3):
+        if not 0.0 < alpha <= 1.0:
+            raise ValueError(f"EMAFilter alpha debe estar en (0, 1]. Valor recibido: {alpha}")
+        self.alpha = alpha
+        self._value: Optional[float] = None
+
+    def update(self, x: float) -> float:
+        if self._value is None:
+            self._value = x
+        else:
+            self._value = self.alpha * x + (1.0 - self.alpha) * self._value
+        return self._value
+
+    def reset(self):
+        self._value = None
+
+    @property
+    def value(self) -> Optional[float]:
+        return self._value
+
+
 class SO101Controller:
     def __init__(self):
         cfg = SO101FollowerConfig(
@@ -69,6 +121,13 @@ class SO101Controller:
         )
 
         self.logger = MPCLogger(logs_dir="logs")
+
+        # Filtros EMA para suavizar las coordenadas normalizadas del objeto.
+        self._ema_x = EMAFilter(alpha=0.3)
+        self._ema_y = EMAFilter(alpha=0.3)
+
+        # Pose interpolada más reciente (para tracking continuo).
+        self._tracking_command_pose: Optional[Pose] = None
 
     def connect(self):
         if self.connected:
@@ -91,6 +150,75 @@ class SO101Controller:
 
     def get_pose(self):
         return self.robot.get_observation()
+
+    # -----------------------------------------------------------------------
+    # Interpolación IDW: convierte posición normalizada en pose articular
+    # -----------------------------------------------------------------------
+
+    def interpolate_pose_from_position(
+        self,
+        x_norm: float,
+        y_norm: float,
+        power: float = 2.0,
+        smooth: bool = True,
+    ) -> Optional[Pose]:
+        """
+        Interpola una pose articular usando Inverse Distance Weighting (IDW)
+        entre las poses de zona calibradas.
+
+        Args:
+            x_norm: Coordenada X normalizada del objeto [0, 1].
+            y_norm: Coordenada Y normalizada del objeto [0, 1].
+            power:  Exponente IDW. Más alto = más peso a la zona más cercana.
+            smooth: Si True, aplica filtro EMA antes de interpolar.
+
+        Returns:
+            Pose interpolada como dict, o None si no hay zonas calibradas.
+        """
+        if not ZONE_POSES:
+            return None
+
+        # Aplicar filtro EMA a las coordenadas del objeto
+        if smooth:
+            x_s = self._ema_x.update(x_norm)
+            y_s = self._ema_y.update(y_norm)
+        else:
+            x_s = x_norm
+            y_s = y_norm
+
+        # Calcular distancias a cada zona en el espacio normalizado
+        distances = {}
+        for zone, (zx, zy) in ZONE_GRID_COORDS.items():
+            if zone not in ZONE_POSES:
+                continue
+            dist = math.sqrt((x_s - zx) ** 2 + (y_s - zy) ** 2)
+            distances[zone] = dist
+
+        # Si el objeto cae exactamente sobre una zona, retornar esa pose
+        for zone, dist in distances.items():
+            if dist < 1e-9:
+                return ZONE_POSES[zone].copy()
+
+        # Calcular pesos IDW
+        weights = {zone: 1.0 / (dist ** power) for zone, dist in distances.items()}
+        total_weight = sum(weights.values())
+
+        # Interpolar joint por joint
+        interpolated: Pose = {}
+        for joint in JOINT_KEYS:
+            value = 0.0
+            for zone, w in weights.items():
+                if joint in ZONE_POSES[zone]:
+                    value += w * ZONE_POSES[zone][joint]
+            interpolated[joint] = value / total_weight
+
+        return interpolated
+
+    def reset_tracking_filters(self):
+        """Reinicia los filtros EMA. Llamar al perder el objeto."""
+        self._ema_x.reset()
+        self._ema_y.reset()
+        self._tracking_command_pose = None
 
     def print_current_pose(self, title="Pose actual"):
         print(f"\n{title}:")
@@ -302,6 +430,57 @@ class SO101Controller:
             print_every=10,
             log_label="home",
         )
+
+    def mpc_track_continuous(
+        self,
+        x_norm: float,
+        y_norm: float,
+        control_dt: float = 0.02,
+    ) -> bool:
+        """
+        Una única iteración MPC de tracking continuo.
+
+        Diseñado para ser llamado repetidamente desde el hilo de control
+        del robot mientras el objeto esté visible. No espera convergencia:
+        simplemente calcula el próximo paso hacia la pose interpolada
+        y lo envía al robot.
+
+        Args:
+            x_norm:     Posición X normalizada del objeto [0, 1].
+            y_norm:     Posición Y normalizada del objeto [0, 1].
+            control_dt: Tiempo de espera después de enviar el comando (segundos).
+
+        Returns:
+            True si se envió comando, False si no hay robot conectado o pose.
+        """
+        if not self.connected:
+            return False
+
+        target_pose = self.interpolate_pose_from_position(x_norm, y_norm)
+
+        if target_pose is None:
+            return False
+
+        # Inicializar la pose de comando con la pose real la primera vez.
+        if self._tracking_command_pose is None:
+            self._tracking_command_pose = self.get_pose().copy()
+
+        # Calcular próximo paso con gains de tracking (más agresivo).
+        action, max_error, _, _ = self.mpc.compute_next_action_tracking(
+            current_pose=self._tracking_command_pose,
+            target_pose=target_pose,
+        )
+
+        # Actualizar la pose de comando interna.
+        for joint in JOINT_KEYS:
+            if joint in action:
+                self._tracking_command_pose[joint] = action[joint]
+
+        # Enviar al robot.
+        self.robot.send_action(self._tracking_command_pose)
+        time.sleep(control_dt)
+
+        return True
 
     def go_ready(self):
         print("\nMoviendo a READY con MPC...")
