@@ -6,11 +6,21 @@ import subprocess
 import sys
 import time
 
+try:
+    import serial
+except ImportError:
+    serial = None
+
 from vision_neon_green import detect_neon_green_paper, CAMERA_INDEX
 from so101_controller import SO101Controller
 
 
 USE_ROBOT = True
+USE_LEDS = True
+
+ESP32_LED_PORT = "/dev/ttyUSB0"
+ESP32_LED_BAUDRATE = 115200
+
 DETECT_EVERY_N_FRAMES = 2
 
 FRAMES_TO_CONFIRM_DETECTED = 8
@@ -21,6 +31,78 @@ PRINT_DETECTION_EVERY_N_FRAMES = 15
 LOGS_DIR = "logs"
 PLOTS_DIR = "plots"
 OPEN_PLOTS_ON_EXIT = True
+
+
+class LEDController:
+    """
+    Controla los LEDs conectados a la ESP32 de forma automática.
+
+    Python manda:
+    p = prender LEDs
+    o = apagar LEDs
+    """
+
+    def __init__(self, port="/dev/ttyUSB0", baudrate=115200, enabled=True):
+        self.port = port
+        self.baudrate = baudrate
+        self.enabled = enabled
+        self.esp32 = None
+        self.current_state = None
+
+    def connect(self):
+        if not self.enabled:
+            print("[LEDController] Control de LEDs desactivado.")
+            return
+
+        if serial is None:
+            print("[LEDController] pyserial no está instalado. Ejecuta: pip install pyserial")
+            self.enabled = False
+            return
+
+        try:
+            self.esp32 = serial.Serial(self.port, self.baudrate, timeout=1)
+            time.sleep(2)
+            self.off()
+            print(f"[LEDController] ESP32 conectada en {self.port}")
+        except Exception as e:
+            self.esp32 = None
+            self.enabled = False
+            print(f"[LEDController] No se pudo conectar la ESP32 en {self.port}: {e}")
+            print("[LEDController] El programa continuará sin LEDs.")
+
+    def send(self, command):
+        if not self.enabled:
+            return
+
+        if self.esp32 is None:
+            return
+
+        if not self.esp32.is_open:
+            return
+
+        try:
+            self.esp32.write(command.encode("utf-8"))
+        except Exception as e:
+            print(f"[LEDController] Error enviando comando a ESP32: {e}")
+
+    def on(self):
+        if self.current_state != "on":
+            self.send("p")
+            self.current_state = "on"
+            print("[LEDController] LEDs ON")
+
+    def off(self):
+        if self.current_state != "off":
+            self.send("o")
+            self.current_state = "off"
+            print("[LEDController] LEDs OFF")
+
+    def close(self):
+        self.off()
+
+        if self.esp32 is not None and self.esp32.is_open:
+            self.esp32.close()
+            print("[LEDController] ESP32 desconectada")
 
 
 def get_tracking_zone(x, y, frame_width, frame_height):
@@ -333,6 +415,7 @@ def draw_ui(
     detected_counter,
     not_detected_counter,
     robot_busy,
+    led_state,
 ):
     result = draw_tracking_grid(frame, tracking["current_zone"])
     result = draw_zone_ranges(result)
@@ -400,7 +483,7 @@ def draw_ui(
 
     cv2.putText(
         result,
-        f"CONTROL: MPC ASYNC | ROBOT: {robot_status}",
+        f"CONTROL: MPC ASYNC | ROBOT: {robot_status} | LEDS: {led_state}",
         (30, 330),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.65,
@@ -411,6 +494,49 @@ def draw_ui(
     return result
 
 
+def update_leds_for_state(
+    leds,
+    auto_mode,
+    robot_connected,
+    current_state,
+    detected_counter,
+    tracking,
+):
+    """
+    Reglas:
+    - Si está en SAFE_HOME, LEDs apagados.
+    - Si no está en modo automático, LEDs apagados.
+    - Si no hay robot conectado, LEDs apagados.
+    - Si está detectando objetivo verde en automático, LEDs encendidos.
+    - Si no detecta objetivo, LEDs apagados.
+    """
+
+    if current_state == "SAFE_HOME":
+        leds.off()
+        return "OFF"
+
+    if not auto_mode:
+        leds.off()
+        return "OFF"
+
+    if not robot_connected:
+        leds.off()
+        return "OFF"
+
+    target_visible = (
+        detected_counter > 0
+        and tracking["current_zone"] is not None
+        and tracking["last_robot_target"] is not None
+    )
+
+    if target_visible:
+        leds.on()
+        return "ON"
+
+    leds.off()
+    return "OFF"
+
+
 def main():
     session_start_time = time.time()
 
@@ -419,6 +545,13 @@ def main():
     if not cap.isOpened():
         print("No se pudo abrir la camara.")
         return
+
+    leds = LEDController(
+        port=ESP32_LED_PORT,
+        baudrate=ESP32_LED_BAUDRATE,
+        enabled=USE_LEDS,
+    )
+    leds.connect()
 
     robot = None
     robot_connected = False
@@ -435,11 +568,13 @@ def main():
     current_state = "CAMERA_ONLY"
     auto_mode = False
     already_safe_homed = False
+    led_state = "OFF"
 
     print("Sistema iniciado.")
     print("Detectando color verde fosforescente tipo #39FF14.")
     print("Dividiendo la imagen en 9 zonas.")
     print("Control activo: MPC articular en segundo plano.")
+    print("Control LEDs: automatico por ESP32.")
     print("Al salir, se generarán automáticamente las gráficas MPC.")
     print("Teclas:")
     print("  r = conectar/calibrar robot")
@@ -461,6 +596,8 @@ def main():
 
                     if current_state == "SAFE_HOME":
                         already_safe_homed = True
+                        leds.off()
+                        led_state = "OFF"
                     else:
                         already_safe_homed = False
 
@@ -475,6 +612,7 @@ def main():
 
             if not ret:
                 print("No se pudo leer frame.")
+                leds.off()
                 break
 
             frame_count += 1
@@ -520,6 +658,15 @@ def main():
                     tracking["confirmed_zone"] = None
                     tracking["last_robot_target"] = None
                     tracking["last_seen_zone"] = None
+
+                led_state = update_leds_for_state(
+                    leds=leds,
+                    auto_mode=auto_mode,
+                    robot_connected=robot_connected,
+                    current_state=current_state,
+                    detected_counter=detected_counter,
+                    tracking=tracking,
+                )
 
                 if (
                     color_detected
@@ -567,6 +714,9 @@ def main():
                 ):
                     print("Post-it no detectado. Moviendo a SAFE HOME con MPC.")
 
+                    leds.off()
+                    led_state = "OFF"
+
                     started = start_robot_task(
                         robot_task=robot_task,
                         robot_task_lock=robot_task_lock,
@@ -591,6 +741,7 @@ def main():
                 detected_counter=detected_counter,
                 not_detected_counter=not_detected_counter,
                 robot_busy=robot_busy,
+                led_state=led_state,
             )
 
             cv2.imshow("Deteccion post-it verde + zonas + MPC", result)
@@ -602,6 +753,9 @@ def main():
 
             if key == ord("q"):
                 print("Saliendo del programa...")
+
+                leds.off()
+                led_state = "OFF"
 
                 wait_for_robot_task(robot_task, robot_task_lock)
 
@@ -622,16 +776,23 @@ def main():
                     robot_connected = True
                     current_state = "ROBOT_CONNECTED"
                     already_safe_homed = False
+                    leds.off()
+                    led_state = "OFF"
                     print("SO-101 listo.")
                 except Exception as e:
                     print(f"ERROR al conectar SO-101: {e}")
                     robot = None
                     robot_connected = False
+                    leds.off()
+                    led_state = "OFF"
 
             if key == ord("h") and USE_ROBOT and robot_connected:
                 print("Moviendo manualmente a SAFE HOME con MPC...")
 
                 auto_mode = False
+                leds.off()
+                led_state = "OFF"
+
                 wait_for_robot_task(robot_task, robot_task_lock)
 
                 started = start_robot_task(
@@ -651,6 +812,9 @@ def main():
                 print("Moviendo manualmente a READY con MPC...")
 
                 auto_mode = False
+                leds.off()
+                led_state = "OFF"
+
                 wait_for_robot_task(robot_task, robot_task_lock)
 
                 started = start_robot_task(
@@ -670,6 +834,8 @@ def main():
             if key == ord("a"):
                 if not robot_connected:
                     print("Primero conecta el robot con r.")
+                    leds.off()
+                    led_state = "OFF"
                 else:
                     auto_mode = not auto_mode
 
@@ -677,9 +843,15 @@ def main():
                     not_detected_counter = 0
                     tracking = reset_tracking_state()
 
+                    if not auto_mode:
+                        leds.off()
+                        led_state = "OFF"
+
                     print(f"Modo automatico: {auto_mode}")
 
     finally:
+        leds.off()
+
         cap.release()
         cv2.destroyAllWindows()
 
@@ -689,11 +861,14 @@ def main():
             if not already_safe_homed:
                 try:
                     print("Asegurando SAFE HOME antes de desconectar con MPC...")
+                    leds.off()
                     move_robot_to_safe_home(robot)
                 except Exception as e:
                     print(f"No se pudo mover a SAFE HOME antes de desconectar: {e}")
 
             robot.disconnect()
+
+        leds.close()
 
         generate_plots_for_session(session_start_time)
 
